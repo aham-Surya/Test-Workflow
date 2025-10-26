@@ -1,55 +1,47 @@
+// server.js
 require("dotenv").config();
 const express = require("express");
-const bodyParser = require("body-parser");
 const axios = require("axios");
 const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
-const http = require("http");
-const { Server } = require("socket.io");
-const Groq = require("groq").default;
 
-// ---- Config ----
-const FB_API_VERSION = "v19.0";
-const PORT = process.env.PORT || 3000;
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ---- CONFIG ----
 const FB_APP_ID = process.env.FB_APP_ID;
 const FB_APP_SECRET = process.env.FB_APP_SECRET;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const BASE_URL = process.env.BASE_URL;
 const FB_REDIRECT_URI = process.env.FB_REDIRECT_URI;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const FB_API_VERSION = process.env.FB_API_VERSION || "v19.0";
+const PORT = process.env.PORT || 3000;
 
-// ---- App Setup ----
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
-const groqClient = new Groq({ apiKey: GROQ_API_KEY });
+// ---- SQLite DB ----
+const DB_PATH = path.join(__dirname, "data.sqlite");
+const db = new sqlite3.Database(DB_PATH);
 
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-app.set("view engine", "ejs");
-app.set("views", path.join(__dirname, "views"));
-app.use(express.static(path.join(__dirname, "public")));
-
-// ---- Database ----
-const db = new sqlite3.Database("./data.sqlite", (err) => {
-  if (err) console.error("DB Error:", err);
-});
-
-// Create tables if not exists
 db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS pages (
+  db.run(`
+    CREATE TABLE IF NOT EXISTS pages (
       id INTEGER PRIMARY KEY,
       page_id TEXT UNIQUE,
       page_name TEXT,
-      page_access_token TEXT
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS whatsapp (
+      page_access_token TEXT,
+      subscribed INTEGER DEFAULT 0
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS whatsapp (
       id INTEGER PRIMARY KEY,
       phone_number_id TEXT UNIQUE,
       token TEXT,
       display_phone_number TEXT
-  )`);
-  db.run(`CREATE TABLE IF NOT EXISTS messages (
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       platform TEXT,
       chat_id TEXT,
@@ -57,205 +49,202 @@ db.serialize(() => {
       text TEXT,
       direction TEXT,
       timestamp INTEGER
-  )`);
+    )
+  `);
 });
 
-// ---- Helpers ----
-const savePage = (page_id, page_name, token) => {
-  db.run(
-    `INSERT OR REPLACE INTO pages (page_id, page_name, page_access_token) VALUES (?, ?, ?)`,
-    [page_id, page_name, token]
-  );
-};
-
-const getAnyPage = async () => {
-  return new Promise((resolve, reject) => {
-    db.get(`SELECT * FROM pages LIMIT 1`, [], (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
-  });
-};
-
-const saveWhatsapp = (phone_number_id, token, display) => {
-  db.run(
-    `INSERT OR REPLACE INTO whatsapp (phone_number_id, token, display_phone_number) VALUES (?, ?, ?)`,
-    [phone_number_id, token, display]
-  );
-};
-
-const getWhatsapp = async () => {
-  return new Promise((resolve, reject) => {
-    db.get(`SELECT * FROM whatsapp LIMIT 1`, [], (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
-  });
-};
-
-const saveMessage = (platform, chat_id, sender_id, text, direction) => {
-  const ts = Math.floor(Date.now() / 1000);
+// ---- DB helpers ----
+function dbInsertMessage(platform, chat_id, sender_id, text, direction) {
   db.run(
     `INSERT INTO messages (platform, chat_id, sender_id, text, direction, timestamp) VALUES (?, ?, ?, ?, ?, ?)`,
-    [platform, chat_id, sender_id, text, direction, ts]
+    [platform, chat_id, sender_id, text, direction, Date.now()]
   );
-};
+}
 
-// AI reply with memory
-let chatMemory = {}; // { chat_id: [{role, content}] }
+function getAnyPage(callback) {
+  db.get("SELECT * FROM pages LIMIT 1", (err, row) => {
+    callback(row ? row : null);
+  });
+}
 
-const generateAIReply = async (chat_id, userText) => {
-  chatMemory[chat_id] = chatMemory[chat_id] || [];
-  chatMemory[chat_id].push({ role: "user", content: userText });
+function getWhatsapp(callback) {
+  db.get("SELECT * FROM whatsapp LIMIT 1", (err, row) => {
+    callback(row ? row : null);
+  });
+}
 
-  const messages = chatMemory[chat_id].slice(-10); // last 10 messages
-
+// ---- Groq AI ----
+async function generateAIReply(messages) {
   try {
-    const comp = await groqClient.chat.completions.create({
-      model: "openai/gpt-oss-120b",
-      messages: messages,
-    });
-    const reply = comp.choices[0].message.content;
-    chatMemory[chat_id].push({ role: "assistant", content: reply });
-    return reply;
-  } catch (err) {
-    console.error("Groq Error:", err);
-    return "Sorry, AI is unreachable.";
+    const res = await axios.post(
+      "https://api.groq.com/v1/chat/completions",
+      {
+        model: "openai/gpt-oss-120b",
+        messages: messages,
+      },
+      {
+        headers: {
+          "Authorization": `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    return res.data.choices[0].message.content;
+  } catch (e) {
+    console.error("Groq API error:", e.response?.data || e.message);
+    return "Sorry, I can't respond right now.";
   }
-};
+}
+
+// ---- Messenger send ----
+async function sendMessengerMessage(pageToken, recipientId, text) {
+  await axios.post(
+    `https://graph.facebook.com/${FB_API_VERSION}/me/messages`,
+    { recipient: { id: recipientId }, message: { text } },
+    { params: { access_token: pageToken } }
+  );
+}
+
+// ---- WhatsApp send ----
+async function sendWhatsappMessage(phone_number_id, token, to_number, text) {
+  await axios.post(
+    `https://graph.facebook.com/${FB_API_VERSION}/${phone_number_id}/messages`,
+    { messaging_product: "whatsapp", to: to_number, type: "text", text: { body: text } },
+    { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+  );
+}
 
 // ---- Routes ----
-app.get("/", async (req, res) => {
-  const page = await getAnyPage();
-  const wa = await getWhatsapp();
-  res.render("index", { page, wa });
+app.get("/", (req, res) => {
+  res.send("Meta Chatbot running!");
 });
 
-// FB OAuth
+// Facebook OAuth connect
 app.get("/connect", (req, res) => {
-  const url =
-    `https://www.facebook.com/${FB_API_VERSION}/dialog/oauth?` +
+  const fb_oauth = `https://www.facebook.com/${FB_API_VERSION}/dialog/oauth?` +
     new URLSearchParams({
       client_id: FB_APP_ID,
       redirect_uri: FB_REDIRECT_URI,
-      scope: "pages_show_list,pages_messaging,business_management",
+      scope: "pages_show_list,pages_messaging,whatsapp_business_messaging,business_management",
       response_type: "code",
     });
-  res.redirect(url);
+  res.redirect(fb_oauth);
 });
 
-// FB Callback
+// Facebook OAuth callback
 app.get("/facebook/callback", async (req, res) => {
   const code = req.query.code;
-  if (!code) return res.status(400).send("No code");
+  if (!code) return res.status(400).send("No code returned");
 
-  const tokenResp = await axios.get(
-    `https://graph.facebook.com/${FB_API_VERSION}/oauth/access_token`,
-    { params: { client_id: FB_APP_ID, redirect_uri: FB_REDIRECT_URI, client_secret: FB_APP_SECRET, code } }
-  );
+  // Exchange code for user access token
+  const tokenResp = await axios.get(`https://graph.facebook.com/${FB_API_VERSION}/oauth/access_token`, {
+    params: { client_id: FB_APP_ID, redirect_uri: FB_REDIRECT_URI, client_secret: FB_APP_SECRET, code }
+  });
 
   const userToken = tokenResp.data.access_token;
-  const pagesResp = await axios.get(`https://graph.facebook.com/${FB_API_VERSION}/me/accounts`, { params: { access_token: userToken } });
+
+  // Get pages
+  const pagesResp = await axios.get(`https://graph.facebook.com/${FB_API_VERSION}/me/accounts`, {
+    params: { access_token: userToken }
+  });
+
   const pages = pagesResp.data.data;
   if (pages.length > 0) {
-    savePage(pages[0].id, pages[0].name, pages[0].access_token);
+    const page = pages[0];
+    db.run(`INSERT OR REPLACE INTO pages (page_id, page_name, page_access_token, subscribed) VALUES (?, ?, ?, 1)`,
+      [page.id, page.name, page.access_token]);
   }
+
   res.redirect("/");
 });
 
-// Save WA creds
+// WhatsApp setup
 app.post("/save_whatsapp", (req, res) => {
   const { phone_id, token, display } = req.body;
-  if (!phone_id || !token) return res.status(400).send("Missing WA credentials");
-  saveWhatsapp(phone_id, token, display);
+  if (!phone_id || !token) return res.status(400).send("phone_id and token required");
+  db.run(`INSERT OR REPLACE INTO whatsapp (phone_number_id, token, display_phone_number) VALUES (?, ?, ?)`,
+    [phone_id, token, display]);
   res.redirect("/");
 });
 
-// Webhook (FB Messenger + WhatsApp)
+// Webhook verification & handling
 app.all("/webhook", async (req, res) => {
   if (req.method === "GET") {
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
-    if (mode && token === VERIFY_TOKEN) return res.status(200).send(challenge);
-    return res.sendStatus(403);
+    if (mode && token === VERIFY_TOKEN) return res.send(challenge);
+    return res.status(403).send("Verification failed");
   }
 
   const data = req.body;
-  try {
-    if (data.entry) {
-      for (const entry of data.entry) {
-        // Messenger messages
-        if (entry.messaging) {
-          for (const ev of entry.messaging) {
-            if (ev.message && !ev.message.is_echo && ev.message.text) {
-              const chat_id = ev.thread_id || entry.id;
-              const text = ev.message.text;
-              saveMessage("messenger", chat_id, ev.sender.id, text, "incoming");
-              const page = await getAnyPage();
+
+  // Messenger messages
+  if (data.entry) {
+    for (const entry of data.entry) {
+      if (entry.messaging) {
+        for (const ev of entry.messaging) {
+          if (ev.message && !ev.message.is_echo && ev.message.text) {
+            const text = ev.message.text;
+            const senderId = ev.sender.id;
+            const chatId = entry.id || senderId;
+
+            dbInsertMessage("messenger", chatId, senderId, text, "incoming");
+
+            const messagesForAI = [
+              { role: "system", content: "You are a helpful assistant." },
+              { role: "user", content: text }
+            ];
+            const reply = await generateAIReply(messagesForAI);
+
+            getAnyPage(async (page) => {
               if (page) {
-                const reply = await generateAIReply(chat_id, text);
-                await axios.post(`https://graph.facebook.com/${FB_API_VERSION}/me/messages`, {
-                  recipient: { id: ev.sender.id },
-                  message: { text: reply },
-                }, { params: { access_token: page.page_access_token } });
-                saveMessage("messenger", chat_id, "page", reply, "outgoing");
+                await sendMessengerMessage(page.page_access_token, senderId, reply);
+                dbInsertMessage("messenger", chatId, "page", reply, "outgoing");
               }
-            }
+            });
           }
         }
+      }
 
-        // WhatsApp messages
-        if (entry.changes) {
-          for (const change of entry.changes) {
-            const val = change.value;
-            if (val.messages) {
-              for (const m of val.messages) {
-                const txt = m.text?.body;
-                const from = m.from;
-                const chat_id = val.metadata.phone_number_id;
-                if (txt) {
-                  saveMessage("whatsapp", chat_id, from, txt, "incoming");
-                  const wa = await getWhatsapp();
-                  if (wa) {
-                    const reply = await generateAIReply(chat_id, txt);
-                    await axios.post(
-                      `https://graph.facebook.com/${FB_API_VERSION}/${wa.phone_number_id}/messages`,
-                      { messaging_product: "whatsapp", to: from, type: "text", text: { body: reply } },
-                      { headers: { Authorization: `Bearer ${wa.token}` } }
-                    );
-                    saveMessage("whatsapp", chat_id, "wa_bot", reply, "outgoing");
+      // WhatsApp messages
+      if (entry.changes) {
+        for (const change of entry.changes) {
+          const value = change.value || {};
+          const messages = value.messages || [];
+          for (const m of messages) {
+            if (m.text && m.text.body) {
+              const txt = m.text.body;
+              const fromNumber = m.from;
+              const chatId = value.metadata?.phone_number_id || "";
+
+              dbInsertMessage("whatsapp", chatId, fromNumber, txt, "incoming");
+
+              getWhatsapp(async (wa) => {
+                if (wa && wa.token && wa.phone_number_id) {
+                  const reply = await generateAIReply([
+                    { role: "system", content: "You are a helpful assistant." },
+                    { role: "user", content: txt }
+                  ]);
+                  try {
+                    await sendWhatsappMessage(wa.phone_number_id, wa.token, fromNumber, reply);
+                    dbInsertMessage("whatsapp", wa.phone_number_id, "wa_bot", reply, "outgoing");
+                  } catch (e) {
+                    console.error("WA send failed:", e.message);
                   }
                 }
-              }
+              });
             }
           }
         }
       }
     }
-    res.send("EVENT_RECEIVED");
-  } catch (err) {
-    console.error("Webhook error:", err, data);
-    res.sendStatus(500);
   }
+
+  res.send("EVENT_RECEIVED");
 });
 
-// Socket.io for dashboard real-time
-io.on("connection", (socket) => {
-  console.log("Client connected");
-  socket.on("send_message", async ({ chat_id, text, platform }) => {
-    const reply = await generateAIReply(chat_id, text);
-    io.emit("chat", { chat_id, text, reply, platform });
-  });
-  socket.on("disconnect", () => console.log("Client disconnected"));
+// Start server
+app.listen(PORT, () => {
+  console.log(`Meta Chatbot running on port ${PORT}`);
 });
-
-// Dashboard API
-app.get("/messages", (req, res) => {
-  db.all(`SELECT * FROM messages ORDER BY id DESC LIMIT 200`, [], (err, rows) => {
-    if (err) return res.status(500).send(err);
-    res.json(rows.reverse());
-  });
-});
-
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
