@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Meta Chatbot Dashboard</title>
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <h1>Meta Chatbot Dashboard</h1>
+
+  <% if (page) { %>
+    <p>Connected FB Page: <%= page.page_name %></p>
+  <% } else { %>
+    <a href="/connect">Connect Facebook Page</a>
+  <% } %>
+
+  <% if (wa) { %>
+    <p>WhatsApp: <%= wa.display_phone_number || wa.phone_number_id %></p>
+  <% } else { %>
+    <form method="POST" action="/save_whatsapp">
+      <input name="phone_id" placeholder="Phone Number ID" required>
+      <input name="token" placeholder="Token" required>
+      <input name="display" placeholder="Display Name">
+      <button>Save WhatsApp</button>
+    </form>
+  <% } %>
+
+  <div id="chat"></div>
+
+  <script>
+    const socket = io();
+    socket.on("chat", ({ chat_id, text, reply, platform }) => {
+      const div = document.createElement("div");
+      div.innerHTML = `<b>${platform}:</b> ${text} <i>→ AI:</i> ${reply || ''}`;
+      document.getElementById("chat").appendChild(div);
+    });
+  </script>
+</body>
+</html>
